@@ -361,3 +361,59 @@ describe('reasoning runStream', () => {
     expect(doneEvent.result.answer).toBeTruthy()
   })
 })
+
+// =============================================================================
+// tempModel 透传（多租户实例凭据）
+// =============================================================================
+
+describe('reasoning tempModel 透传', () => {
+  const tempModel = { model: 'instance-model', apiKey: 'sk-instance', baseUrl: 'https://llm.example.com/v1' }
+
+  it('react 内部调用透传 tempModel', async () => {
+    const mockLLM = createMockLLM([{ content: '直接回答', finish_reason: 'stop' }])
+    const reasoning = createReasoningOperations(mockConfig, mockLLM)
+
+    const result = await reasoning.run('问题', { strategy: 'react', tempModel })
+    expect(result.success).toBe(true)
+
+    const chatMock = mockLLM.chat as ReturnType<typeof vi.fn>
+    expect(chatMock).toHaveBeenCalledTimes(1)
+    expect(chatMock.mock.calls[0][0].tempModel).toEqual(tempModel)
+  })
+
+  it('cot 内部调用透传 tempModel', async () => {
+    const mockLLM = createMockLLM([{ content: 'Step 1: 分析\nAnswer: 42' }])
+    const reasoning = createReasoningOperations(mockConfig, mockLLM)
+
+    await reasoning.run('问题', { strategy: 'cot', tempModel })
+
+    const chatMock = mockLLM.chat as ReturnType<typeof vi.fn>
+    expect(chatMock.mock.calls[0][0].tempModel).toEqual(tempModel)
+  })
+
+  it('plan-execute 规划与执行两阶段均透传 tempModel', async () => {
+    const mockLLM = createMockLLM([
+      { content: '1. 计划步骤' },
+      { content: '完成', finish_reason: 'stop' },
+    ])
+    const reasoning = createReasoningOperations(mockConfig, mockLLM)
+
+    const result = await reasoning.run('问题', { strategy: 'plan-execute', tempModel })
+    expect(result.success).toBe(true)
+
+    const chatMock = mockLLM.chat as ReturnType<typeof vi.fn>
+    expect(chatMock).toHaveBeenCalledTimes(2)
+    expect(chatMock.mock.calls[0][0].tempModel).toEqual(tempModel)
+    expect(chatMock.mock.calls[1][0].tempModel).toEqual(tempModel)
+  })
+
+  it('未传 tempModel 时为 undefined（不改变既有行为）', async () => {
+    const mockLLM = createMockLLM([{ content: 'ok', finish_reason: 'stop' }])
+    const reasoning = createReasoningOperations(mockConfig, mockLLM)
+
+    await reasoning.run('问题', { strategy: 'react' })
+
+    const chatMock = mockLLM.chat as ReturnType<typeof vi.fn>
+    expect(chatMock.mock.calls[0][0].tempModel).toBeUndefined()
+  })
+})

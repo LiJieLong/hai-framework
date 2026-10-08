@@ -8,7 +8,7 @@
 
 import type { HaiResult } from '@h-ai/core'
 
-import type { ChatMessage, ToolRegistryOperations } from '../llm/ai-llm-types.js'
+import type { ChatMessage, TempModelConfig, ToolRegistryOperations } from '../llm/ai-llm-types.js'
 
 // ─── 推理策略 ───
 
@@ -41,6 +41,14 @@ export interface ReasoningOptions {
   planModel?: string
   /** Plan-Execute 执行阶段模型（可选，默认回退到 `model` → 场景 `execute` → 场景 `reasoning`） */
   executeModel?: string
+  /**
+   * 临时模型配置（可选，透传给内部全部 LLM 调用）
+   *
+   * 与 `llm.chat` 的 `tempModel` 语义一致：绕过配置注册模型与场景映射，直接指定
+   * 端点/凭据/模型（多租户实例各自携带凭据场景）；提供后 `model`/`planModel`/
+   * `executeModel` 的场景解析结果不再生效（plan-execute 规划与执行两阶段共用）。
+   */
+  tempModel?: TempModelConfig
   /** 系统提示词（可选，覆盖默认的策略提示词） */
   systemPrompt?: string
   /** 是否启用内部 LLM 调用的持久化（默认 true；Context 层调用时传 false 避免重复记录） */
