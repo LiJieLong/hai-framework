@@ -180,6 +180,138 @@ export function createReasoningOperations(config: AIConfig, llm: LLMOperations):
   }
 
   /**
+   * 执行流式 ReAct 策略推理（真流式）
+   *
+   * 与 `runReact` 循环逻辑一致，区别在于每个步骤在产生时**立即产出**（yield），
+   * 而非等待全部轮次结束后统一产出；生成器 return 值携带最终结果（成功或失败），
+   * 失败时不产出 `done` 事件（由 `runStream` 转为异常抛出）。
+   */
+  async function* runReactStream(
+    query: string,
+    options: ReasoningOptions,
+  ): AsyncGenerator<ReasoningStreamEvent, HaiResult<ReasoningResult>, void> {
+    const maxRounds = options.maxRounds ?? 10
+    const systemPrompt = options.systemPrompt ?? REACT_SYSTEM_PROMPT
+    const steps: ReasoningStep[] = []
+    let stepIndex = 0
+
+    const messages: ChatMessage[] = [
+      { role: 'system', content: systemPrompt },
+      ...(options.messages ?? []),
+      { role: 'user', content: query },
+    ]
+
+    for (let round = 0; round < maxRounds; round++) {
+      // 调用 LLM
+      const chatResult = await llm.chat({
+        model: scenarioModel('reasoning', options.model),
+        messages,
+        temperature: options.temperature,
+        tempModel: options.tempModel,
+        tools: options.tools?.getDefinitions(),
+        tool_choice: options.tools ? 'auto' : undefined,
+        objectId: options.objectId,
+        sessionId: options.sessionId,
+        enablePersist: options.enablePersist,
+        signal: options.signal,
+      })
+
+      if (!chatResult.success)
+        return chatResult
+
+      const choice = chatResult.data.choices[0]
+      if (!choice) {
+        return err(HaiAIError.REASONING_FAILED, aiM('ai_internalError', { params: { error: 'No response from LLM' } }))
+      }
+
+      const assistantMessage = choice.message
+
+      // 记录思考步骤（产生即产出）
+      if (assistantMessage.content) {
+        const thoughtStep: ReasoningStep = {
+          type: 'thought',
+          content: typeof assistantMessage.content === 'string' ? assistantMessage.content : '',
+          index: stepIndex++,
+        }
+        steps.push(thoughtStep)
+        yield { type: 'step', step: thoughtStep }
+      }
+
+      // 添加助手消息到历史
+      messages.push(assistantMessage)
+
+      // 如果有工具调用
+      if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0 && options.tools) {
+        for (const toolCall of assistantMessage.tool_calls) {
+          if (toolCall.type !== 'function')
+            continue
+          // 记录 action 步骤（产生即产出）
+          const actionStep: ReasoningStep = {
+            type: 'action',
+            content: `Calling tool: ${toolCall.function.name}`,
+            toolCall: {
+              name: toolCall.function.name,
+              arguments: JSON.parse(toolCall.function.arguments) as Record<string, unknown>,
+            },
+            index: stepIndex++,
+          }
+          steps.push(actionStep)
+          yield { type: 'step', step: actionStep }
+
+          // 执行工具（透传取消信号与作用域，打断 / 超时时可提前中止耗时工具）
+          const toolResult = await options.tools.execute(toolCall, { signal: options.signal, objectId: options.objectId, sessionId: options.sessionId })
+          const rawToolContent = toolResult.success
+            ? toolResult.data.content
+            : `Tool error: ${toolResult.error.message}`
+          const toolContent = typeof rawToolContent === 'string'
+            ? rawToolContent
+            : (rawToolContent as Array<{ text?: string }>).map(p => p.text ?? '').join(' ')
+
+          // 记录 observation 步骤（产生即产出）
+          const observationStep: ReasoningStep = {
+            type: 'observation',
+            content: toolContent,
+            index: stepIndex++,
+          }
+          steps.push(observationStep)
+          yield { type: 'step', step: observationStep }
+
+          // 添加工具消息
+          messages.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            content: toolContent,
+          })
+        }
+        continue
+      }
+
+      // 完成推理
+      if (choice.finish_reason === 'stop') {
+        const answer = typeof assistantMessage.content === 'string' ? assistantMessage.content : ''
+        steps.push({ type: 'answer', content: answer, index: stepIndex })
+
+        // 最终答案以 delta 增量产出（answer 步不单独产出，由 delta 表达）
+        if (answer)
+          yield { type: 'delta', text: answer }
+
+        const finalResult: ReasoningResult = {
+          answer,
+          steps,
+          strategy: 'react',
+          rounds: round + 1,
+          messages,
+        }
+        yield { type: 'done', result: finalResult }
+        return ok(finalResult)
+      }
+    }
+
+    // 达到最大轮次
+    return err(HaiAIError.REASONING_MAX_ROUNDS, aiM('ai_internalError', { params: { error: `Max rounds (${maxRounds}) reached` } }))
+  }
+
+  /**
    * 执行 Chain-of-Thought 策略推理
    */
   async function runCoT(
@@ -386,10 +518,21 @@ export function createReasoningOperations(config: AIConfig, llm: LLMOperations):
     /**
      * 流式推理：逐步产出推理步骤 + 最终答案增量
      *
-     * 当前实现基于 run() 的结果分步产出事件，
-     * 后续可优化为真正逐轮流式输出。
+     * `react` 策略为真流式：每轮 LLM 响应 / 工具观察产生时立即产出对应事件
+     * （不等全部轮次结束，首轮思考即可见）；其余策略基于 `run()` 结果分步产出。
+     * 失败时不产出 `done`，直接抛出错误（与 run 的 err 对齐）。
      */
     async* runStream(query: string, options?: ReasoningOptions): AsyncIterable<ReasoningStreamEvent> {
+      const strategy = options?.strategy ?? 'react'
+
+      // ReAct 真流式：委托逐轮产出生成器，失败转为异常（与旧行为兼容）
+      if (strategy === 'react') {
+        const reactResult = yield* runReactStream(query, options ?? {})
+        if (!reactResult.success)
+          throw reactResult.error
+        return
+      }
+
       const result = await this.run(query, options)
 
       if (!result.success) {

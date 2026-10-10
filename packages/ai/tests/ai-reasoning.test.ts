@@ -360,6 +360,59 @@ describe('reasoning runStream', () => {
     expect(doneEvent.result).toBeDefined()
     expect(doneEvent.result.answer).toBeTruthy()
   })
+
+  it('react 真流式：首轮步骤在后续 LLM 调用前产出（不等全部轮次完成）', async () => {
+    const mockLLM = createMockLLM([
+      { content: '先查数据', tool_calls: [{ id: 'call-1', type: 'function', function: { name: 't1', arguments: '{}' } }] },
+      { content: '最终答案 42', finish_reason: 'stop' },
+    ])
+    const reasoning = createReasoningOperations(mockConfig, mockLLM)
+    const chatMock = mockLLM.chat as ReturnType<typeof vi.fn>
+
+    const mockTools = {
+      getDefinitions: () => [{ type: 'function', function: { name: 't1', description: 'test tool', parameters: { type: 'object', properties: {} } } }],
+      execute: vi.fn(async () => ({ success: true as const, data: { content: '工具结果' } })),
+    } as unknown as ToolRegistryOperations
+
+    const arrivals: Array<{ type: string, chatsSoFar: number }> = []
+    for await (const event of reasoning.runStream('问题', { tools: mockTools })) {
+      arrivals.push({ type: event.type, chatsSoFar: chatMock.mock.calls.length })
+    }
+
+    // 真流式核心断言：首个事件（首轮思考）到达时仅发起过 1 次 LLM 调用
+    // （旧「run 完成后整批产出」实现在此处已调用 2 次）
+    expect(arrivals[0].type).toBe('step')
+    expect(arrivals[0].chatsSoFar).toBe(1)
+
+    // 事件序列：首轮 thought/action/observation → 末轮 thought → delta → done
+    expect(arrivals.map(a => a.type)).toEqual(['step', 'step', 'step', 'step', 'delta', 'done'])
+  })
+
+  it('react 真流式：失败时不产出 done（异常抛出，与 run err 对齐）', async () => {
+    const mockLLM = createMockLLM([
+      { content: '思考中', tool_calls: [{ id: 'call-1', type: 'function', function: { name: 't1', arguments: '{}' } }] },
+    ])
+    // 工具始终失败 + 单响应队列（后续轮次复用），不产生 stop → 达最大轮次
+    const mockTools = {
+      getDefinitions: () => [{ type: 'function', function: { name: 't1', description: 'test tool', parameters: { type: 'object', properties: {} } } }],
+      execute: vi.fn(async () => ({ success: false as const, error: { message: '工具失败' } })),
+    } as unknown as ToolRegistryOperations
+
+    const reasoning = createReasoningOperations(mockConfig, mockLLM)
+    const types: string[] = []
+    let threw = false
+    try {
+      for await (const event of reasoning.runStream('问题', { tools: mockTools, maxRounds: 2 })) {
+        types.push(event.type)
+      }
+    }
+    catch {
+      threw = true
+    }
+
+    expect(threw).toBe(true)
+    expect(types).not.toContain('done')
+  })
 })
 
 // =============================================================================
